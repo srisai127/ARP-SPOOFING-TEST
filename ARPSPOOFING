@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+ARP Spoofing Detector - Real-time Network Security Tool
+Author: Security Tool Suite
+Requirements: scapy, pandas, matplotlib, colorama
+Run as root: sudo python3 arp_spoof_detector.py
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+import argparse
+import threading
+import subprocess
+from datetime import datetime
+from collections import defaultdict
+
+# ── Dependency check ─────────────────────────────────────────────────────────
+def check_and_install(pkg, import_name=None):
+    import importlib
+    name = import_name or pkg
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        print(f"[*] Installing {pkg}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+
+for pkg, imp in [("scapy", "scapy"), ("pandas", "pandas"),
+                  ("matplotlib", "matplotlib"), ("colorama", "colorama")]:
+    check_and_install(pkg, imp)
+
+from scapy.all import ARP, Ether, srp, sniff, conf
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from colorama import Fore, Style, init as colorama_init
+
+colorama_init(autoreset=True)
+conf.verb = 0  # Suppress scapy output
+
+# ── Logging Setup ─────────────────────────────────────────────────────────────
+LOG_FILE = f"arp_detector_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("ARPDetector")
+
+# ── ANSI Banner ───────────────────────────────────────────────────────────────
+BANNER = f"""
+{Fore.RED}╔══════════════════════════════════════════════════════╗
+║      ARP SPOOFING DETECTOR  v1.0                     ║
+║      Real-time Network Security Monitor              ║
+╚══════════════════════════════════════════════════════╝{Style.RESET_ALL}
+"""
+
+# ── ARP Cache & Stats ─────────────────────────────────────────────────────────
+class ARPCache:
+    def __init__(self):
+        self.ip_to_mac: dict[str, str] = {}          # trusted baseline
+        self.mac_to_ips: dict[str, set] = defaultdict(set)
+        self.alerts: list[dict] = []
+        self.packet_count = 0
+        self.attack_count = 0
+        self.lock = threading.Lock()
+
+    def baseline_scan(self, interface: str, network: str) -> int:
+        """Populate baseline using ARP scan of the subnet."""
+        logger.info(f"Scanning network {network} on {interface} for baseline...")
+        try:
+            ans, _ = srp(
+                Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=network),
+                iface=interface, timeout=3
+            )
+            with self.lock:
+                for _, rcv in ans:
+                    ip = rcv[ARP].psrc
+                    mac = rcv[ARP].hwsrc.lower()
+                    self.ip_to_mac[ip] = mac
+                    self.mac_to_ips[mac].add(ip)
+            count = len(self.ip_to_mac)
+            logger.info(f"Baseline established: {count} hosts found.")
+            return count
+        except Exception as e:
+            logger.warning(f"Baseline scan failed: {e}")
+            return 0
+
+    def process_packet(self, pkt) -> dict | None:
+        """Analyze an ARP packet; return alert dict if spoofing detected."""
+        if not pkt.haslayer(ARP):
+            return None
+
+        arp = pkt[ARP]
+        # ARP reply (op=2) or gratuitous ARP
+        if arp.op not in (1, 2):
+            return None
+
+        src_ip  = arp.psrc
+        src_mac = arp.hwsrc.lower()
+
+        with self.lock:
+            self.packet_count += 1
+
+            # ── Detection logic ───────────────────────────────────────────
+            alert = None
+
+            # 1) IP → MAC conflict
+            if src_ip in self.ip_to_mac:
+                known_mac = self.ip_to_mac[src_ip]
+                if known_mac != src_mac:
+                    alert = self._build_alert(
+                        "IP-MAC CONFLICT",
+                        src_ip, src_mac, known_mac,
+                        f"IP {src_ip} changed MAC from {known_mac} → {src_mac}"
+                    )
+
+            # 2) MAC → Multiple IPs (MAC spoofing / proxy)
+            self.mac_to_ips[src_mac].add(src_ip)
+            if len(self.mac_to_ips[src_mac]) > 1:
+                ips = ", ".join(self.mac_to_ips[src_mac])
+                if not alert:  # Don't double-alert same packet
+                    alert = self._build_alert(
+                        "MAC SERVING MULTIPLE IPs",
+                        src_ip, src_mac, "multiple",
+                        f"MAC {src_mac} claims IPs: {ips}"
+                    )
+
+            # Update cache
+            self.ip_to_mac[src_ip] = src_mac
+
+            if alert:
+                self.attack_count += 1
+                self.alerts.append(alert)
+                return alert
+
+        return None
+
+    def _build_alert(self, atype, ip, mac, expected, detail) -> dict:
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "type": atype,
+            "src_ip": ip,
+            "src_mac": mac,
+            "expected": expected,
+            "detail": detail,
+            "severity": "HIGH"
+        }
+
+    def get_stats(self) -> dict:
+        with self.lock:
+            return {
+                "packets": self.packet_count,
+                "attacks": self.attack_count,
+                "hosts": len(self.ip_to_mac),
+                "alerts": list(self.alerts[-20:])   # last 20
+            }
+
+    def export_report(self, path="arp_report.json"):
+        with self.lock:
+            report = {
+                "generated": datetime.now().isoformat(),
+                "summary": {
+                    "total_packets": self.packet_count,
+                    "total_attacks": self.attack_count,
+                    "baseline_hosts": len(self.ip_to_mac)
+                },
+                "baseline": self.ip_to_mac,
+                "alerts": self.alerts
+            }
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"Report saved → {path}")
+        return path
+
+
+# ── Alert Handler ─────────────────────────────────────────────────────────────
+def handle_alert(alert: dict, args):
+    msg = (
+        f"\n{Fore.RED}{'═'*60}\n"
+        f"  ⚠  ARP SPOOFING DETECTED — {alert['type']}\n"
+        f"{'═'*60}{Style.RESET_ALL}\n"
+        f"  Time    : {alert['timestamp']}\n"
+        f"  Attacker: {alert['src_ip']}  ({alert['src_mac']})\n"
+        f"  Detail  : {alert['detail']}\n"
+        f"{Fore.RED}{'═'*60}{Style.RESET_ALL}\n"
+    )
+    print(msg)
+    logger.warning(f"ALERT [{alert['type']}] {alert['detail']}")
+
+    # Optional: block via iptables
+    if getattr(args, "block", False):
+        _block_mac(alert["src_mac"])
+
+
+def _block_mac(mac: str):
+    """Drop traffic from attacker MAC using ebtables (Linux)."""
+    try:
+        subprocess.run(
+            ["ebtables", "-A", "INPUT", "-s", mac, "-j", "DROP"],
+            check=True, capture_output=True
+        )
+        logger.info(f"Blocked MAC {mac} via ebtables.")
+        print(f"{Fore.YELLOW}[BLOCK] MAC {mac} dropped via ebtables.{Style.RESET_ALL}")
+    except Exception as e:
+        logger.warning(f"Could not block {mac}: {e}")
+
+
+# ── Live Console Dashboard ────────────────────────────────────────────────────
+def live_dashboard(cache: ARPCache, stop_event: threading.Event):
+    """Print a refreshing stats summary to terminal."""
+    while not stop_event.is_set():
+        s = cache.get_stats()
+        status = f"{Fore.GREEN}CLEAN{Style.RESET_ALL}" if s["attacks"] == 0 \
+                 else f"{Fore.RED}UNDER ATTACK ({s['attacks']} events){Style.RESET_ALL}"
+        print(
+            f"\r{Fore.CYAN}[LIVE]{Style.RESET_ALL} "
+            f"Pkts:{s['packets']:>6}  "
+            f"Hosts:{s['hosts']:>4}  "
+            f"Attacks:{s['attacks']:>3}  "
+            f"Status: {status}   ",
+            end="", flush=True
+        )
+        time.sleep(1)
+
+
+# ── Matplotlib Visualization ──────────────────────────────────────────────────
+def launch_visualization(cache: ARPCache):
+    """Show a live-updating bar chart of packet vs attack counts."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig.patch.set_facecolor("#0d1117")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#161b22")
+
+    times_x, pkts_y, atk_y = [], [], []
+
+    def update(_):
+        s = cache.get_stats()
+        now = datetime.now().strftime("%H:%M:%S")
+        times_x.append(now)
+        pkts_y.append(s["packets"])
+        atk_y.append(s["attacks"])
+
+        window = 30
+        xs = times_x[-window:]
+        ps = pkts_y[-window:]
+        as_ = atk_y[-window:]
+
+        # Packets timeline
+        ax1.clear()
+        ax1.set_facecolor("#161b22")
+        ax1.plot(xs, ps, color="#58a6ff", linewidth=2, label="Packets")
+        ax1.fill_between(range(len(xs)), ps, alpha=0.2, color="#58a6ff")
+        ax1.set_title("ARP Packets Captured", color="white")
+        ax1.tick_params(colors="gray", labelrotation=30, labelsize=7)
+        ax1.set_ylabel("Count", color="gray")
+        ax1.legend(facecolor="#0d1117", labelcolor="white")
+
+        # Attack events
+        ax2.clear()
+        ax2.set_facecolor("#161b22")
+        ax2.bar(range(len(xs)), as_, color=["#f85149" if v > 0 else "#3fb950" for v in as_])
+        ax2.set_title("Spoofing Events", color="white")
+        ax2.tick_params(colors="gray", labelrotation=30, labelsize=7)
+        ax2.set_ylabel("Attacks", color="gray")
+
+        fig.suptitle("ARP Spoofing Detector — Live Monitor",
+                     color="white", fontsize=13, fontweight="bold")
+
+    ani = animation.FuncAnimation(fig, update, interval=1500, cache_frame_data=False)
+    plt.tight_layout()
+    plt.show()
+
+
+# ── Packet Sniffer Thread ─────────────────────────────────────────────────────
+def sniffer_thread(cache: ARPCache, iface: str, args, stop_event: threading.Event):
+    def _handler(pkt):
+        if stop_event.is_set():
+            return
+        alert = cache.process_packet(pkt)
+        if alert:
+            handle_alert(alert, args)
+
+    logger.info(f"Sniffing ARP on interface: {iface}")
+    sniff(iface=iface, filter="arp", prn=_handler,
+          store=False, stop_filter=lambda _: stop_event.is_set())
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Real-time ARP Spoofing Detector",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    p.add_argument("-i", "--interface", default="eth0",
+                   help="Network interface to monitor (default: eth0)")
+    p.add_argument("-n", "--network", default="192.168.1.0/24",
+                   help="Subnet for baseline scan (default: 192.168.1.0/24)")
+    p.add_argument("--no-baseline", action="store_true",
+                   help="Skip initial ARP scan (faster start)")
+    p.add_argument("--no-gui", action="store_true",
+                   help="Disable matplotlib visualization")
+    p.add_argument("--block", action="store_true",
+                   help="Auto-block attacker MACs via ebtables (root required)")
+    p.add_argument("--report", default="arp_report.json",
+                   help="Output path for JSON report on exit")
+    return p.parse_args()
+
+
+def main():
+    print(BANNER)
+    args = parse_args()
+
+    if os.geteuid() != 0:
+        print(f"{Fore.YELLOW}[!] Warning: Not running as root. "
+              f"Packet capture may fail.{Style.RESET_ALL}")
+
+    cache = ARPCache()
+    stop_event = threading.Event()
+
+    # ── Baseline ──────────────────────────────────────────────────────────
+    if not args.no_baseline:
+        count = cache.baseline_scan(args.interface, args.network)
+        print(f"{Fore.GREEN}[✓] Baseline: {count} hosts discovered.{Style.RESET_ALL}\n")
+    else:
+        print(f"{Fore.YELLOW}[*] Baseline scan skipped.{Style.RESET_ALL}\n")
+
+    # ── Sniffer thread ─────────────────────────────────────────────────────
+    t_sniff = threading.Thread(
+        target=sniffer_thread,
+        args=(cache, args.interface, args, stop_event),
+        daemon=True
+    )
+    t_sniff.start()
+
+    # ── Dashboard thread ───────────────────────────────────────────────────
+    t_dash = threading.Thread(
+        target=live_dashboard, args=(cache, stop_event), daemon=True
+    )
+    t_dash.start()
+
+    print(f"{Fore.CYAN}[*] Monitoring started. Press Ctrl+C to stop.{Style.RESET_ALL}\n")
+
+    try:
+        if not args.no_gui:
+            launch_visualization(cache)   # blocks until window closed
+        else:
+            while True:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        print(f"\n\n{Fore.CYAN}[*] Stopping detector...{Style.RESET_ALL}")
+
+        # ── Final report ───────────────────────────────────────────────────
+        report_path = cache.export_report(args.report)
+        s = cache.get_stats()
+        print(
+            f"\n{Fore.GREEN}{'═'*50}\n"
+            f"  SESSION SUMMARY\n"
+            f"{'═'*50}{Style.RESET_ALL}\n"
+            f"  Packets captured : {s['packets']}\n"
+            f"  Spoofing events  : {s['attacks']}\n"
+            f"  Hosts in cache   : {s['hosts']}\n"
+            f"  Log file         : {LOG_FILE}\n"
+            f"  JSON report      : {report_path}\n"
+            f"{Fore.GREEN}{'═'*50}{Style.RESET_ALL}"
+        )
+
+
+if __name__ == "__main__":
+    main()
