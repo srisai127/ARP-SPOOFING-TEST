@@ -1,3 +1,11 @@
+ARP Spoofing Detector
+Objective: Create a network security tool to detect ARP spoofing attacks in realtime.
+Features:
+• ARP Traffic Monitoring: Capture and analyze ARP packets
+• Spoofing Detection: Identify duplicate IP-MAC mappings
+• Alert System: Notify administrators of attacks
+• Attack Visualization: Show network topology changes
+• Logging & Reporting: Record attack details
 how to run :
 cd ~
 source arp_env/bin/activate
